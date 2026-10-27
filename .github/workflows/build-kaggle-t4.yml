@@ -1,0 +1,200 @@
+name: Build Kaggle T4 (CUDA 12.8)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - ci
+    paths:
+      [
+        ".github/workflows/build-kaggle-t4.yml",
+        "**/CMakeLists.txt",
+        "**/Makefile",
+        "cmake/**",
+        "**/*.h",
+        "**/*.hpp",
+        "**/*.c",
+        "**/*.cpp",
+        "**/*.cu",
+        "ggml",
+        "thirdparty/**",
+        "examples/server/frontend",
+        "examples/server/frontend/**",
+        "examples/server/recipes/*.json",
+        "start-server.sh",
+        "start-server.bat",
+      ]
+
+concurrency:
+  group: kaggle-t4-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-cuda-t4:
+    name: Linux x64 CUDA 12.8 (sm_75)
+    # Ubuntu 22.04 keeps the binary compatible with glibc 2.35+, which covers
+    # current Kaggle/Colab-derived notebook images.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      CUDA_ARCH: "75"
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - name: Clone
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install CUDA toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-compiler-12-8 cuda-libraries-dev-12-8 patchelf zip
+          cuda_root="/usr/local/cuda-12.8"
+          if [ ! -x "$cuda_root/bin/nvcc" ]; then
+            cuda_root="/usr/local/cuda"
+          fi
+          echo "CUDA_HOME=$cuda_root" >> "$GITHUB_ENV"
+          echo "$cuda_root/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$cuda_root/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          "$cuda_root/bin/nvcc" --version
+          cmake --version
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSD_CUDA=ON \
+            -DCMAKE_CUDA_COMPILER="${CUDA_HOME}/bin/nvcc" \
+            -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
+            -DSD_BUILD_SHARED_LIBS=ON \
+            -DSD_BUILD_SHARED_GGML_LIB=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN'
+          cmake --build build --config Release --parallel 2
+
+      - name: Verify
+        run: |
+          mkdir -p /tmp/cuda-driver-stub
+          if [ -e "${CUDA_HOME}/lib64/stubs/libcuda.so" ]; then
+            ln -sf "${CUDA_HOME}/lib64/stubs/libcuda.so" /tmp/cuda-driver-stub/libcuda.so.1
+            export LD_LIBRARY_PATH="/tmp/cuda-driver-stub:${LD_LIBRARY_PATH}"
+          fi
+          ./build/bin/sd-cli --version
+          cuda_lib="$(find build/bin -maxdepth 1 -name 'libggml-cuda*.so' -print -quit)"
+          test -n "$cuda_lib"
+          "${CUDA_HOME}/bin/cuobjdump" --list-elf "$cuda_lib" | grep -m1 "sm_${CUDA_ARCH}"
+
+      - name: Package
+        id: package
+        run: |
+          cp ggml/LICENSE build/bin/ggml.txt
+          cp LICENSE build/bin/stable-diffusion.cpp.txt
+
+          for lib in libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libnvJitLink.so.12; do
+            if [ -e "${CUDA_HOME}/lib64/$lib" ]; then
+              cp -L "${CUDA_HOME}/lib64/$lib" build/bin/
+              patchelf --set-rpath '$ORIGIN' "build/bin/$lib"
+            fi
+          done
+
+          cat > build/bin/KAGGLE.txt <<'EOF'
+          stable-diffusion.cpp - Kaggle T4 build (CUDA 12.8, sm_75)
+
+          Extract this zip and run from the extracted directory:
+            export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
+            chmod +x sd-cli sd-server
+            ./sd-cli --list-devices
+
+          Use both T4s for the diffusion model:
+            ./sd-cli ... --backend "diffusion=cuda0&cuda1" --auto-fit off
+
+          The default layer split is best on T4s, which communicate over PCIe.
+          Row split is available but usually needs faster interconnect:
+            ./sd-cli ... --backend "diffusion=cuda0&cuda1" --split-mode row --auto-fit off
+
+          To keep the text encoder and VAE on the first T4 explicitly:
+            ./sd-cli ... --backend "diffusion=cuda0&cuda1,te=cuda0,vae=cuda0" --auto-fit off
+
+          Start the server on both T4s:
+            ./sd-server --model-dir ./models --backend "diffusion=cuda0&cuda1" --auto-fit off
+
+          Notes:
+          - --sage-attn requires SM80 or newer, so it is unavailable on T4.
+          - --list-devices should show CUDA0 and CUDA1 when two T4s are assigned.
+          EOF
+
+          chmod +x build/bin/sd-cli build/bin/sd-server start-server.sh
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          zip_name="sd-kaggle-t4-cu128-sm75-${short_sha}.zip"
+          zip -j "$zip_name" build/bin/* start-server.sh start-server.bat
+          echo "zip_name=$zip_name" >> "$GITHUB_OUTPUT"
+          du -h "$zip_name"
+
+      - name: Write summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Kaggle T4 build ready
+
+          **Artifact:** `sd-kaggle-t4-cu128-sm75-${{ steps.package.outputs.short_sha }}`
+          (CUDA 12.8, Tesla T4 `sm_75`, Linux x64)
+
+          1. Download the artifact from this workflow run. GitHub wraps the build
+             zip inside the artifact download, so extract the downloaded file once.
+          2. Add the inner `sd-kaggle-t4-cu128-sm75-*.zip` to Kaggle as a dataset,
+             or upload it from the notebook.
+          3. Extract it and run:
+
+          ```bash
+          unzip -q sd-kaggle-t4-cu128-sm75-*.zip -d /kaggle/working/sdcpp
+          cd /kaggle/working/sdcpp
+          export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
+          chmod +x sd-cli sd-server
+          ./sd-cli --list-devices
+          ```
+
+          4. Run on both T4s:
+
+          ```bash
+          ./sd-cli -m /kaggle/input/<models>/model.gguf -p "a cat" \
+            --backend "diffusion=cuda0&cuda1" --auto-fit off -o /kaggle/working/out.png
+          ```
+
+          Use `--split-mode row` only if you want parallel matmuls across both
+          cards; T4s have no NVLink, so the default layer split is usually faster.
+          `--sage-attn` is not available on Turing (SM75).
+          EOF
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sd-kaggle-t4-cu128-sm75-${{ steps.package.outputs.short_sha }}
+          path: ${{ steps.package.outputs.zip_name }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
